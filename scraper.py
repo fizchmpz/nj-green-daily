@@ -153,6 +153,13 @@ h2.sec small{font-weight:normal;color:#8a8577;font-size:12px}
 .warn{background:#fdf6ec;border:1px solid #e3c98f;border-radius:8px;padding:14px 16px;font-size:13px;color:#7a5a12;margin:14px 0}
 .foot{margin-top:44px;border-top:1px solid #d9d4c7;padding-top:18px;font-size:12.5px;color:#8a8577;line-height:1.9}
 .foot b{color:#5c5748}
+.nav{display:flex;justify-content:flex-end;padding:10px 2px 0}
+.nav a{font-size:13px;color:#1f4d3a;text-decoration:none;border:1px solid #1f4d3a;border-radius:16px;padding:4px 14px}
+.nav a.back{border-color:#8a8577;color:#6b6659}
+.arch-item{display:flex;justify-content:space-between;align-items:baseline;background:#fff;border:1px solid #d9d4c7;border-radius:8px;padding:14px 18px;margin-bottom:10px;text-decoration:none;color:#2b2b28}
+.arch-item .d{font-weight:600;font-size:15px}
+.arch-item .s{font-size:12.5px;color:#8a8577}
+.arch-item:active{border-color:#1f4d3a}
 """
 
 def build_html(events, src_status):
@@ -223,6 +230,7 @@ def build_html(events, src_status):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>南京绿灯活动日报 · %s</title>
 <style>%s</style></head><body><div class="wrap">
+<div class="nav"><a href="%s">历史日报</a></div>
 <div class="mast"><h1>南京绿灯活动日报</h1>
 <div class="sub">%s · %s · 第 %s 期</div></div>
 <div class="status">信源状态：%s<br>今日收录 <b>%d</b> 条，其中新增 <b>%d</b> 条 ｜ 固定网址，每天 8:00 前后更新</div>
@@ -233,15 +241,66 @@ def build_html(events, src_status):
 2 · 活动门槛、人群画像等深度信息云端脚本无法自动核验，报名前请自行查看主办方与往期评价。<br>
 3 · 行业峰会、博物馆预约、官方讲座等「深水区」活动不在自动抓取范围，待电脑开机时由 AI 深度版补充。<br>
 4 · 「需甄别」分区是社交导向活动（相亲/交友/联谊），参照此前风评审核结论保留并单独提示。<br>
-生成时间：%s（北京时间）
+生成时间：%s（北京时间）<br>
+<span style="display:inline-block;margin-top:10px"><a class="nav" style="display:inline-block" href="%s">查看往期所有日报</a></span>
 </div></div></body></html>""" % (
-        today_iso, CSS, today_iso, week, TODAY.strftime("%Y%m%d"),
+        today_iso, CSS, "./archive/list.html", today_iso, week, TODAY.strftime("%Y%m%d"),
         " ".join(src_bits), len(events), n_new,
         "\n".join(cards),
-        NOW.strftime("%Y-%m-%d %H:%M"))
+        NOW.strftime("%Y-%m-%d %H:%M"), "./archive/list.html")
     with open(os.path.join(ROOT, "index.html"), "w", encoding="utf-8") as f:
         f.write(page)
+    # 同步存档 + 重建归档清单
+    arch_dir = os.path.join(ROOT, "archive")
+    os.makedirs(arch_dir, exist_ok=True)
+    with open(os.path.join(arch_dir, today_iso + ".html"), "w", encoding="utf-8") as f:
+        f.write(page.replace('href="./archive/list.html"', 'href="list.html"'))
+    rebuild_archive_list(CSS)
     return events, groups, n_new
+
+
+def rebuild_archive_list(css):
+    """扫描 archive/ 下所有期，生成 archive/list.html 清单页（最新在前）。"""
+    arch_dir = os.path.join(ROOT, "archive")
+    os.makedirs(arch_dir, exist_ok=True)
+    items = []
+    for fn in os.listdir(arch_dir):
+        m = re.match(r"(\d{4}-\d{2}-\d{2})\.html$", fn)
+        if not m:
+            continue
+        try:
+            with open(os.path.join(arch_dir, fn), encoding="utf-8") as f:
+                head = f.read(6000)
+            issue = re.search(r"第 (\d+) 期", head)
+            stats = re.search(r"今日收录 <b>(\d+)</b> 条，其中新增 <b>(\d+)</b>", head)
+            week = re.search(r"· (周\S) ·", head)
+            items.append((m.group(1), fn, issue.group(1) if issue else "?",
+                          int(stats.group(1)) if stats else 0,
+                          int(stats.group(2)) if stats else 0,
+                          week.group(1) if week else ""))
+        except Exception:
+            continue
+    items.sort(reverse=True)
+    rows = "".join(
+        '<a class="arch-item" href="%s"><span class="d">%s %s</span>'
+        '<span class="s">第 %s 期 · 收录 %d 条（新增 %d）</span></a>'
+        % (fn, d, wk, iss, tot, nw)
+        for d, fn, iss, tot, nw, wk in items)
+    n = len(items)
+    list_page = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>历史日报清单 · 南京绿灯活动日报</title>
+<style>%s</style></head><body><div class="wrap">
+<div class="nav"><a class="back" href="../index.html">← 返回最新一期</a></div>
+<div class="mast"><h1 style="font-size:26px;letter-spacing:3px">历史日报</h1>
+<div class="sub">共 %d 期 · 按日期倒序 · 错过哪天点哪天</div></div>
+<div style="height:22px"></div>
+%s
+<div class="foot">最早一期之前未开启归档功能，如需更早内容可翻看仓库提交历史。</div>
+</div></body></html>""" % (css, n, rows or '<div class="status">暂无归档，明天 8:00 后将出现第一期。</div>')
+    with open(os.path.join(arch_dir, "list.html"), "w", encoding="utf-8") as f:
+        f.write(list_page)
 
 # ---------------- ntfy 推送 ----------------
 
