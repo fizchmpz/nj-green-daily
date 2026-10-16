@@ -127,6 +127,79 @@ def save_seen(seen):
     with open(os.path.join(ROOT, "data", "seen.json"), "w", encoding="utf-8") as f:
         json.dump(seen, f, ensure_ascii=False, indent=1)
 
+# ---------------- 票价抓取（详情页，带缓存） ----------------
+
+FEE_BUDGET = 12  # 每次运行最多抓 12 个详情页，防止信源改版时拖垮运行
+
+
+def _norm_fee(txt):
+    t = txt.replace("\xa0", " ").strip()
+    if not t:
+        return ""
+    if "免费" in t:
+        return "免费"
+    nums = re.findall(r"\d+(?:\.\d+)?", t)
+    if not nums:
+        return t if len(t) <= 12 else ""
+    vals = ["%g" % float(n) for n in nums]
+    qi = "起" in t
+    if len(vals) >= 2:
+        return "¥%s-¥%s%s" % (vals[0], vals[-1], " 起" if qi else "")
+    return "¥%s%s" % (vals[0], " 起" if qi else "")
+
+
+def fetch_fee_douban(db_id):
+    """豆瓣详情页：itemprop="ticketAggregate">费用: 180.00元起"""
+    d = html_mod.unescape(fetch("https://www.douban.com/event/%s/" % db_id))
+    m = re.search(r"ticketAggregate", d)
+    if not m:
+        return ""
+    m2 = re.search(r"费用:\s*([^<]+?)\s*<", d[m.start():m.start() + 400])
+    return _norm_fee(m2.group(1)) if m2 else ""
+
+
+def fetch_fee_hdx(eid):
+    """活动行详情页：var eventTicketsJson = [{Price, PriceStr, ...}]"""
+    d = fetch("https://www.huodongxing.com/event/%s" % eid)
+    m = re.search(r"eventTicketsJson\s*=\s*(\[.*?\])\s*\|\|", d, re.S)
+    if not m:
+        return ""
+    try:
+        tks = json.loads(m.group(1))
+    except Exception:
+        return ""
+    if not tks:
+        return ""
+    prices = [float(t.get("Price") or 0) for t in tks]
+    if all(p == 0 for p in prices):
+        return "免费"
+    lo = min(p for p in prices if p > 0)
+    hi = max(prices)
+    if hi == lo:
+        return "¥%g" % lo
+    return "¥%g-¥%g" % (lo, hi)
+
+
+def enrich_fees(events, seen):
+    """给缺票价的活动抓详情页，结果写入 seen 缓存，后续天数直接复用。"""
+    budget = FEE_BUDGET
+    for e in events:
+        if not e.get("fee"):
+            e["fee"] = seen.get(e["id"], {}).get("fee", "")
+    for e in events:
+        if e["fee"] or budget <= 0:
+            continue
+        try:
+            if e["source"] == "豆瓣同城":
+                e["fee"] = fetch_fee_douban(e["id"][3:])
+            elif e["source"] == "活动行":
+                e["fee"] = fetch_fee_hdx(e["id"][4:])
+        except Exception as exc:
+            print("[fee] %s failed: %r" % (e["id"], exc))
+        if e["fee"]:
+            seen[e["id"]]["fee"] = e["fee"]
+        budget -= 1
+
 # ---------------- 页面生成 ----------------
 
 CSS = """
@@ -146,6 +219,7 @@ h2.sec small{font-weight:normal;color:#8a8577;font-size:12px}
 .card .tt a:active{color:#1f4d3a}
 .card .meta{margin-top:8px;font-size:13px;color:#6b6659}
 .card .meta b{color:#1f4d3a;font-weight:600}
+.card .meta b.fee{color:#b3541e;font-size:15px}
 .badge{display:inline-block;font-size:11px;padding:1px 8px;border:1px solid #1f4d3a;border-radius:10px;color:#1f4d3a;margin-left:8px;vertical-align:1px}
 .badge.new{background:#1f4d3a;color:#fff}
 .card.yellow{border-color:#c9a24b;background:#fffdf5}
@@ -184,6 +258,9 @@ def build_html(events, src_status):
             uniq.append(e)
     events = uniq
 
+    enrich_fees(events, seen)
+    save_seen(seen)
+
     groups = {}
     for e in events:
         groups.setdefault(classify(e), []).append(e)
@@ -204,10 +281,11 @@ def build_html(events, src_status):
         for e in evs:
             badge = '<span class="badge new">新增</span>' if e["is_new"] else ""
             venue = ('<div class="meta">地点：<b>%s</b></div>' % html_mod.escape(e["venue"])) if e.get("venue") else ""
+            fee = ('<div class="meta">费用：<b class="fee">%s</b></div>' % html_mod.escape(e["fee"])) if e.get("fee") else ""
             cards.append(
                 '<div class="card%s">'
                 '<div class="tt"><a href="%s" target="_blank">%s</a>%s%s</div>'
-                '<div class="meta">时间：<b>%s</b>｜来源：%s</div>%s'
+                '<div class="meta">时间：<b>%s</b>｜来源：%s</div>%s%s'
                 '</div>' % (
                     " yellow" if yellow else "",
                     html_mod.escape(e["link"], quote=True),
@@ -215,7 +293,7 @@ def build_html(events, src_status):
                     '<span class="badge">%s</span>' % html_mod.escape(e["source"]),
                     badge,
                     html_mod.escape(e.get("time_text") or "详见活动页"),
-                    e["source"], venue))
+                    e["source"], fee, venue))
         _ = e  # noqa
 
     src_bits = []
@@ -237,7 +315,7 @@ def build_html(events, src_status):
 %s
 <div class="foot">
 <b>阅读须知</b><br>
-1 · 本页由云服务器每天自动抓取公开活动页生成（豆瓣同城南京 + 活动行南京），名额与价格以你点开的报名页实时显示为准。<br>
+1 · 本页由云服务器每天自动抓取公开活动页生成（豆瓣同城南京 + 活动行南京），名额与价格以你点开的报名页实时显示为准；费用为脚本抓到的票种起价，多票种取最低档。<br>
 2 · 活动门槛、人群画像等深度信息云端脚本无法自动核验，报名前请自行查看主办方与往期评价。<br>
 3 · 行业峰会、博物馆预约、官方讲座等「深水区」活动不在自动抓取范围，待电脑开机时由 AI 深度版补充。<br>
 4 · 「需甄别」分区是社交导向活动（相亲/交友/联谊），参照此前风评审核结论保留并单独提示。<br>
